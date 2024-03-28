@@ -1,4 +1,5 @@
 import torch
+torch.cuda.set_device(0)
 
 
 def scal(α, f, batch=False):

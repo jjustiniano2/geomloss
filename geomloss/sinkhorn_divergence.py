@@ -32,6 +32,7 @@ with a Kullback-Leibler divergence defined through:
 import numpy as np
 import torch
 from functools import partial
+torch.cuda.set_device(0)
 
 try:  # Import the keops library, www.kernel-operations.io
     from pykeops.torch import generic_logsumexp
@@ -123,6 +124,7 @@ def sinkhorn_cost(
         else:
             return b_x, a_y
 
+
     else:  # Actually compute the Sinkhorn divergence
         if (
             debias
@@ -175,11 +177,13 @@ def sinkhorn_loop(
             C_xxs, C_yys = [C_xxs], [C_yys]
         C_xys, C_yxs = [C_xys], [C_yxs]
 
-    torch.autograd.set_grad_enabled(False)
+    torch.autograd.set_grad_enabled(True)
 
     k = 0  # Scale index; we start at the coarsest resolution available
     ε = ε_s[k]
     λ = dampening(ε, ρ)
+    #print(jumps)
+    #print(ε_s)
 
     # Load the measures and cost matrices at the current scale:
     α_log, β_log = α_logs[k], β_logs[k]
@@ -286,11 +290,164 @@ def sinkhorn_loop(
             b_y = λ * softmin(ε, C_yy, (β_log + b_y / ε).detach())
 
         # The cross-updates should be done in parallel!
-        a_y, b_x = λ * softmin(ε, C_yx, (α_log + b_x / ε).detach()), λ * softmin(
-            ε, C_xy, (β_log + a_y / ε).detach()
+        a_y, b_x = λ * softmin(ε, C_yx, (α_log + b_x / ε)), λ * softmin(
+            ε, C_xy, (β_log + a_y / ε)
         )
 
     if debias:
         return a_x, b_y, a_y, b_x
     else:
         return None, None, a_y, b_x
+
+
+def barycenter_loop(
+    softmin,
+    α_logs,
+    β_logs,
+    C_xzs,
+    C_yzs,
+    C_zxs,
+    C_zys,
+    ε_s,
+    rho,
+    lambda_=0.5,
+    jumps=[],
+    kernel_truncation=None,
+    truncate=5,
+    cost=None,
+    extrapolate=None,
+    debias=True,
+    last_extrapolation=True,
+):
+
+    Nits = len(ε_s)
+    if type(α_logs) is not list:
+        α_logs, β_logs = [α_logs], [β_logs]
+        C_xzs, C_yzs = [C_xzs], [C_yzs]
+        C_zxs, C_zys = [C_zxs], [C_zys]
+
+    #torch.autograd.set_grad_enabled(False)
+
+    k = 0  # Scale index; we start at the coarsest resolution available
+    ε = ε_s[k]
+    λ = dampening(ε, rho)
+
+    # Load the measures and cost matrices at the current scale:
+    α_log, β_log = α_logs[k], β_logs[k]
+    C_xz, C_yz = C_xzs[k], C_yzs[k]
+    C_zx, C_zy = C_zxs[k], C_zys[k]
+
+    # Initialize barycenter
+    gamma_log = (lambda_ * (α_log.detach().exp()) +(1-lambda_)*(β_log.detach().exp())).log()
+    d_log = torch.zeros_like(gamma_log)
+
+    # Start with a decent initialization for the dual vectors:
+    #u_1 = λ * softmin(ε, C_xz, gamma_log)  # OT(α,α)
+    #u_2 = λ * softmin(ε, C_yz, gamma_log)  # OT(β,β)
+    #v_1 = λ * softmin(ε, C_zx, β_log)  # OT(α,β) wrt. b
+    #v_2 = λ * softmin(ε, C_zy, α_log)  # OT(α,β) wrt. a
+    u_1 = torch.zeros_like(α_log)  # OT(α,α)
+    u_2 = torch.zeros_like(β_log)  # OT(β,β)
+    v_1 = torch.zeros_like(gamma_log)  # OT(α,β) wrt. b
+    v_2 = torch.zeros_like(gamma_log) # OT(α,β) wrt. a
+
+    for i, ε in enumerate(ε_s):  # ε-scaling descent -----------------------
+
+        λ = dampening(ε, rho)  # ε has changed, so we should update λ too!
+        for j in np.arange(2):
+            # "Coordinate ascent" on the dual problems:
+            u_1 = λ * softmin(ε, C_xz, gamma_log + v_1 / ε)  # OT(α,α)
+            u_2 = λ * softmin(ε, C_yz, gamma_log + v_2 / ε)  # OT(β,β)
+            gamma_log = lambda_*(-softmin(ε, C_zy, α_log + u_1 / ε)/ε)+(1-lambda_)* (- softmin(ε, C_zx, β_log + u_2 / ε)/ε) + d_log
+            v_1 = λ * softmin(ε, C_zy, α_log + u_1 / ε)  # OT(α,β) wrt. a
+            v_2 = λ * softmin(ε, C_zx, β_log + u_2 / ε)  # OT(α,β) wrt. b
+            d_log = 0.5 * (d_log + gamma_log + softmin(ε, C_xz, d_log) / ε)
+
+            # Symmetrized updates:
+            #u_1, u_2 = 0.5 * (u_1 + u_1t), 0.5 * (u_2 + u_2t)  # OT(α,α), OT(β,β)
+            #v_1, v_2 = 0.5 * (v_1 + v_1t), 0.5 * (v_2 + v_2t)  # OT(α,β) wrt. a, b
+
+        if i in jumps:  # Jump from a coarse to a finer scale --------------
+
+            if i == len(ε_s) - 1:  # Last iteration: just extrapolate!
+
+                if debias:
+                    C_xz_, C_yz_ = C_xzs[k + 1], C_yzs[k + 1]
+                C_zx_, C_zy_ = C_zxs[k + 1], C_zys[k + 1]
+
+                last_extrapolation = False  # No need to re-extrapolate after the loop
+                torch.autograd.set_grad_enabled(True)
+
+            else:  # It's worth investing some time on kernel truncation...
+
+                # Kernel truncation trick (described in Bernhard Schmitzer's 2016 paper),
+                # that typically relies on KeOps' block-sparse routines:
+                if debias:
+                    C_xz_, _ = kernel_truncation(
+                        C_xz,
+                        C_xz,
+                        C_xzs[k + 1],
+                        C_xzs[k + 1],
+                        a_x,
+                        a_x,
+                        ε,
+                        truncate=truncate,
+                        cost=cost,
+                    )
+                    C_yz_, _ = kernel_truncation(
+                        C_yz,
+                        C_yz,
+                        C_yzs[k + 1],
+                        C_yzs[k + 1],
+                        b_y,
+                        b_y,
+                        ε,
+                        truncate=truncate,
+                        cost=cost,
+                    )
+                C_zx_, C_zy_ = kernel_truncation(
+                    C_zx,
+                    C_zy,
+                    C_zxs[k + 1],
+                    C_zys[k + 1],
+                    b_x,
+                    a_y,
+                    ε,
+                    truncate=truncate,
+                    cost=cost,
+                )
+
+            # Extrapolation for the symmetric problems:
+            if debias:
+                a_x = extrapolate(a_x, a_x, ε, λ, C_xz, α_log, C_xz_)
+                b_y = extrapolate(b_y, b_y, ε, λ, C_yz, β_log, C_yz_)
+
+            # The cross-updates should be done in parallel!
+            a_y, b_x = extrapolate(a_y, b_x, ε, λ, C_zy, α_log, C_zy_), extrapolate(
+                b_x, a_y, ε, λ, C_zx, β_log, C_zx_
+            )
+
+            # Update the measure weights and cost "matrices":
+            k = k + 1
+            α_log, β_log = α_logs[k], β_logs[k]
+            if debias:
+                C_xz, C_yz = C_xz_, C_yz_
+            C_zx, C_zy = C_zx_, C_zy_
+
+    torch.autograd.set_grad_enabled(True)
+
+    #if last_extrapolation:
+        ## Last extrapolation, to get the correct gradients:
+        #if debias:
+            #a_x = λ * softmin(ε, C_xz, (α_log + a_x / ε).detach())
+            #b_y = λ * softmin(ε, C_yz, (β_log + b_y / ε).detach())
+
+        # The cross-updates should be done in parallel!
+        #a_y, b_x = λ * softmin(ε, C_zy, (α_log + b_x / ε).detach()), λ * softmin(
+            #ε, C_zx, (β_log + a_y / ε).detach()
+        #)
+    return gamma_log.exp()/gamma_log.exp().sum()
+    #if debias:
+        #return a_x, b_y, a_y, b_x
+    #else:
+        #return None, None, a_y, b_x

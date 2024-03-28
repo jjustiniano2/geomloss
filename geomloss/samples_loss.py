@@ -2,12 +2,14 @@ import torch
 from torch.nn import Module
 from functools import partial
 import warnings
+torch.cuda.set_device(0)
 
 from .kernel_samples import kernel_tensorized, kernel_online, kernel_multiscale
 
 from .sinkhorn_samples import sinkhorn_tensorized
 from .sinkhorn_samples import sinkhorn_online
 from .sinkhorn_samples import sinkhorn_multiscale
+from .sinkhorn_samples import barycenter_tensorized
 
 from .kernel_samples import kernel_tensorized as hausdorff_tensorized
 from .kernel_samples import kernel_online as hausdorff_online
@@ -478,3 +480,37 @@ class SamplesLoss(Module):
             )
 
         return B, N, M, D
+
+def barycenter(
+    α,
+    x,
+    β,
+    y,
+    z,
+    p=2,
+    lambda_=0.5,
+    blur=0.05,
+    reach=None,
+    diameter=None,
+    scaling=0.5,
+    cost=None,
+    debias=True,
+    potentials=False,
+    **kwargs
+):
+    return barycenter_tensorized(
+    α=α,
+    x=x,
+    β=β,
+    y=y,
+    z=z,
+    p=p,
+    lambda_=lambda_,
+    blur=blur,
+    reach=reach,
+    diameter=diameter,
+    scaling=scaling,
+    cost=cost,
+    debias=debias,
+    potentials=potentials,
+    **kwargs)

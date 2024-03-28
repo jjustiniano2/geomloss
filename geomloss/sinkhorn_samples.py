@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 from functools import partial
+torch.cuda.set_device(0)
 
 try:  # Import the keops library, www.kernel-operations.io
     from pykeops.torch import generic_logsumexp
@@ -16,7 +17,7 @@ except:
 from .utils import scal, squared_distances, distances
 
 from .sinkhorn_divergence import epsilon_schedule, scaling_parameters
-from .sinkhorn_divergence import dampening, log_weights, sinkhorn_cost, sinkhorn_loop
+from .sinkhorn_divergence import dampening, log_weights, sinkhorn_cost, sinkhorn_loop, barycenter_loop
 
 
 # ==============================================================================
@@ -59,7 +60,7 @@ def sinkhorn_tensorized(
     C_xx, C_yy = (
         (cost(x, x.detach()), cost(y, y.detach())) if debias else (None, None)
     )  # (B,N,N), (B,M,M)
-    C_xy, C_yx = (cost(x, y.detach()), cost(y, x.detach()))  # (B,N,M), (B,M,N)
+    C_xy, C_yx = (cost(x, y), cost(y, x))  # (B,N,M), (B,M,N)
 
     diameter, ε, ε_s, ρ = scaling_parameters(x, y, p, blur, reach, diameter, scaling)
 
@@ -404,3 +405,58 @@ def sinkhorn_multiscale(
         return f_x, g_y
     else:
         return cost
+
+# ==============================================================================
+#                          backend == "barycenter"
+# ==============================================================================
+
+def barycenter_tensorized(
+    α,
+    x,
+    β,
+    y,
+    z,
+    p=2,
+    lambda_=0.5,
+    blur=0.05,
+    reach=None,
+    diameter=None,
+    scaling=0.5,
+    cost=None,
+    debias=True,
+    potentials=False,
+    **kwargs
+):
+
+    B, N, D = x.shape
+    _, M, _ = y.shape
+    _, C, _ = z.shape
+
+    if cost is None:
+        cost = cost_routines[p]
+
+    C_xz, C_yz = (
+        (cost(x.detach(), z.detach()), cost(y.detach(), z.detach()))
+    )  # (B,N,C), (B,M,C)
+    C_zx, C_zy = (cost(z.detach(), x.detach()), cost(z.detach(), y.detach()))  # (B,C,N), (B,C,M)
+
+    diameter, ε, ε_s, rho = scaling_parameters(x, z, p, blur, reach, diameter, scaling)
+
+    bary = barycenter_loop(
+        softmin_tensorized,
+        log_weights(α),
+        log_weights(β),
+        C_xz,
+        C_yz,
+        C_zx,
+        C_zy,
+        ε_s,
+        rho,
+        lambda_=lambda_,
+        debias=debias,
+    )
+
+    return bary
+    #return sinkhorn_cost(
+    #    ε, �, α, β, a_x, b_y, a_y, b_x, batch=True, debias=debias, potentials=potentials
+    #)
